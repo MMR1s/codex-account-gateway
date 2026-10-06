@@ -1,5 +1,6 @@
 . (Join-Path $PSScriptRoot 'runtime.ps1')
-foreach ($name in @('gateway.pid', 'worker-a.pid', 'worker-b.pid')) {
+$pidNames = @('gateway.pid') + @(Get-ChildItem -LiteralPath $statePath -Filter 'worker-*.pid' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+foreach ($name in $pidNames) {
     $pidPath = Join-Path $statePath $name
     if (Test-Path -LiteralPath $pidPath) {
         $taskPid = [int](Get-Content -LiteralPath $pidPath)

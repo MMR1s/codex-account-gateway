@@ -1,24 +1,25 @@
-I built a local account gateway for Codex, and I’m sharing the experiment on GitHub.
+I built Codex Relay — a local control room for my Codex workspace — and made it open source.
 
-The idea is simple: keep the Codex app and local workspace familiar, while two separately authenticated accounts can handle model requests through a local router.
+The idea: keep my chats, files, and projects in one place while routing model requests through a pool of separately signed-in accounts.
 
-When the selected account reports an allowance limit before output starts, the gateway can try the other account. Credentials and quotas stay separate.
+The dashboard brings together:
+• Manual account switching
+• Five-hour and weekly allowance, remaining percentages, and reset times
+• A spatial view of recorded agents and their subagents, with lights for observed gateway requests
+• Token usage, request timing, outcomes, and charts
+• Automatic failover on recognized usage limits before output starts
 
-I also added a dashboard that shows:
-• Which account is selected and which account handled each request
-• Actual five-hour and weekly allowance percentages, remaining allowance, and reset times
-• Input, output, and cached tokens observed by the gateway
-• Request duration, outcomes, and account switches
+Each account keeps its own credentials and allowance. The gateway records request metadata, not conversation text, and token totals cover traffic passing through it.
 
-Your local chats and files stay in the same place. Remote access still uses the account signed into your Codex desktop; routing model requests through another account doesn’t change that desktop login.
+For remote work, use SSH to the machine running Codex and the gateway. The workspace stays on that machine; SSH is configured separately.
 
-It’s an independent, experimental project built with FastAPI and LiteLLM OAuth helpers. Both accounts and live usage reporting have been tested. Limit failover is covered by automated tests; I haven’t deliberately exhausted subscriptions or verified phone control together with failover. Account-bound compacted context can still require the original account.
+Built with Python, FastAPI, and LiteLLM OAuth helpers. Windows setup included. MIT licensed.
 
-No prompts or response text are stored in the activity database. Tokens shown are gateway-observed usage, not lifetime account totals.
+This is an independent experiment, and backend compatibility can change. Account-bound compacted context can still require the original account.
 
-Code, Windows setup, and architecture:
+Code and setup:
 https://github.com/MMR1s/codex-account-gateway
 
-Feedback and contributions are welcome.
+Feedback, issues, and contributions are welcome.
 
-#Codex #OpenSource #Python #DeveloperTools
+#Codex #OpenSource #DeveloperTools

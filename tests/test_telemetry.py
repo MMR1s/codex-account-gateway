@@ -3,9 +3,45 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import tempfile
 import unittest
+import sqlite3
+from contextlib import closing
 from telemetry import Telemetry, normalize_quota
 
 class TelemetryTests(unittest.TestCase):
+    def test_live_thread_identity_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ledger=Telemetry(Path(folder))
+            main='01a11296-80b8-74f0-bd83-cf5df814ab6a'
+            child='01a1114e-8fc5-7430-b762-6993bc6597cf'
+            a=ledger.begin('a','test-model',main)
+            b=ledger.begin('b','test-model',child)
+            live=ledger.summary()['inflight']
+            self.assertEqual({(row['slot'],row['thread_id']) for row in live},{('a',main),('b',child)})
+            ledger.end(b)
+            self.assertEqual([row['thread_id'] for row in ledger.summary()['inflight']],[main])
+            ledger.end(a)
+            self.assertEqual(ledger.summary()['inflight'],[])
+
+    def test_unknown_session_is_unattributed_and_never_stored(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ledger=Telemetry(Path(folder))
+            ledger.begin('a','test-model','private token-like session value')
+            result=ledger.summary()
+            self.assertIsNone(result['inflight'][0]['thread_id'])
+            self.assertNotIn('private',str(result))
+
+    def test_legacy_inflight_schema_migrates_without_losing_totals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state=Path(folder)
+            with closing(sqlite3.connect(state/'activity.sqlite3')) as db:
+                db.execute('CREATE TABLE inflight(id TEXT PRIMARY KEY,slot TEXT,model TEXT,at REAL)')
+                db.commit()
+            ledger=Telemetry(state)
+            ledger.record('a','test','completed',{'input_tokens':10,'output_tokens':2},1)
+            ledger.begin('a','test','01a11296-80b8-74f0-bd83-cf5df814ab6a')
+            self.assertEqual(Telemetry(state).summary()['accounts']['a']['input_tokens'],10)
+            self.assertEqual(len(ledger.summary()['inflight']),1)
+
     def test_quota_whitelist_and_windows(self):
         quota=normalize_quota({'email':'private@example.test','account_id':'private','plan_type':'plus','rate_limit':{'primary_window':{'used_percent':18,'limit_window_seconds':18000,'reset_at':123},'secondary_window':{'used_percent':27,'limit_window_seconds':604800,'reset_at':456}}})
         self.assertEqual(quota['windows'][0]['remaining_percent'],82)
@@ -24,3 +60,27 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(result['metered'],1)
             self.assertEqual(result['attempts'],2)
             self.assertEqual(Telemetry(state).quota('a')['state'],'available')
+
+    def test_chart_aggregates_and_real_quota_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ledger=Telemetry(Path(folder))
+            ledger.record('c','test-model','completed',{'input_tokens':30,'output_tokens':10},1)
+            ledger.quota('c',{'state':'available','windows':[{'label':'Weekly','used_percent':17}]})
+            summary=ledger.summary()
+            self.assertEqual(summary['hourly'][0]['tokens'],40)
+            self.assertEqual(summary['hourly'][0]['slot'],'c')
+            self.assertEqual(summary['quota_history'][0]['used_percent'],17)
+
+    def test_live_requests_do_not_increment_completed_totals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ledger=Telemetry(Path(folder))
+            identifier=ledger.begin('a','model')
+            live=ledger.summary()
+            self.assertEqual(live['inflight'][0]['slot'],'a')
+            self.assertEqual(live['accounts'],{})
+            ledger.record('a','model','completed',{'input_tokens':10,'output_tokens':3},1)
+            ledger.end(identifier)
+            completed=ledger.summary()
+            self.assertEqual(completed['inflight'],[])
+            self.assertEqual(completed['accounts']['a']['completed'],1)
+            self.assertEqual(completed['accounts']['a']['input_tokens'],10)

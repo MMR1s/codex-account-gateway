@@ -1,6 +1,6 @@
-"""Loopback Responses gateway with isolated LiteLLM OAuth workers.
+"""Loopback Responses gateway with an expandable pool of isolated OAuth workers.
 
-Secrets and runtime state live in work/gateway-state, outside the deliverable.
+Secrets and runtime state live in a private runtime directory, excluded from Git.
 """
 from __future__ import annotations
 
@@ -30,7 +30,14 @@ STATE.mkdir(parents=True, exist_ok=True)
 PYTHON = Path(sys.executable)
 if PYTHON.name.lower() == 'pythonw.exe':
     PYTHON = PYTHON.with_name('python.exe')
-PORTS = {'a': 4001, 'b': 4002}
+def load_slots():
+    try:
+        slots = json.loads((STATE / 'workers.json').read_text()).get('slots', [])
+    except (OSError, ValueError):
+        slots = []
+    slots = sorted(set(['a', 'b'] + [s for s in slots if isinstance(s, str) and len(s) == 1 and 'a' <= s <= 'z']))
+    return {slot: 4001 + ord(slot) - ord('a') for slot in slots}
+PORTS = load_slots()
 def configured_model():
     import tomllib
     try:
@@ -39,7 +46,8 @@ def configured_model():
         return 'gpt-5.4'
 MODEL = os.environ.get('CODEX_GATEWAY_MODEL') or configured_model()
 CREATE_HIDDEN = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-from telemetry import Telemetry, normalize_quota
+from telemetry import Telemetry, normalize_quota, thread_identifier
+from local_agents import agent_snapshot
 
 
 def secret_file(name):
@@ -117,6 +125,16 @@ def events(text):
                 pass
 
 
+def request_thread_id(headers):
+    # Recent Codex uses hyphenated names. A subagent may share its parent's
+    # session, so its own thread-id must take precedence.
+    for name in ('thread-id', 'x-codex-thread-id', 'session-id', 'session_id', 'x-session-id'):
+        identifier = thread_identifier(headers.get(name))
+        if identifier:
+            return identifier
+    return None
+
+
 def subscription_request(body, compact=False):
     body = dict(body)
     if isinstance(body.get('input'), str):
@@ -160,6 +178,7 @@ def worker_app(slot):
     auth = NoninteractiveAuth()
     auth_lock = asyncio.Lock()
     ledger = Telemetry(STATE)
+    ledger.reset_inflight(slot)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -206,7 +225,8 @@ def worker_app(slot):
         compact = request.url.path.endswith('/compact')
         body = subscription_request(await request.json(), compact)
         started = time.monotonic()
-        session = request.headers.get('session_id') or request.headers.get('x-session-id')
+        session = request.headers.get('session-id') or request.headers.get('session_id') or request.headers.get('x-session-id')
+        tracking_id = ledger.begin(slot, body.get('model'), request_thread_id(request.headers))
         headers = get_chatgpt_default_headers(access, aid, session)
         headers['Accept'] = 'application/json' if compact else 'text/event-stream'
         path = '/responses/compact' if compact else '/responses'
@@ -215,6 +235,8 @@ def worker_app(slot):
                                                 json=body, headers=headers)
             upstream = await app.state.client.send(req, stream=True)
         except httpx.HTTPError:
+            ledger.record(slot, body.get('model'), 'network_error', None, time.monotonic() - started)
+            ledger.end(tracking_id)
             raise HTTPException(502, 'Could not reach the subscription backend')
         if upstream.status_code >= 400 or compact or not body.get('stream'):
             data = await upstream.aread()
@@ -224,6 +246,7 @@ def worker_app(slot):
             except ValueError:
                 payload = {}
             ledger.record(slot, body.get('model'), 'completed' if upstream.status_code < 400 else f'http_{upstream.status_code}', payload.get('usage'), time.monotonic() - started)
+            ledger.end(tracking_id)
             return Response(data, upstream.status_code,
                 headers={k: v for k, v in upstream.headers.items()
                          if k.lower() in ('content-type', 'retry-after')})
@@ -247,8 +270,9 @@ def worker_app(slot):
                         pending = b''
                     yield chunk
             finally:
-                await upstream.aclose()
                 ledger.record(slot, body.get('model'), outcome, usage_data, time.monotonic() - started)
+                ledger.end(tracking_id)
+                await upstream.aclose()
         return StreamingResponse(chunks(), media_type='text/event-stream')
 
     return app
@@ -260,38 +284,92 @@ class RoutingState:
             self.active = json.loads((STATE / 'routing.json').read_text()).get('active', 'a')
         except (OSError, ValueError):
             self.active = 'a'
-        self.cooldown = {'a': 0.0, 'b': 0.0}
+        if self.active not in PORTS:
+            self.active = next(iter(PORTS))
+        self.cooldown = {s: 0.0 for s in PORTS}
+        self.revision = 0
         self.last_event = 'Last selected account; updates when a request is routed'
 
     def candidates(self):
-        return [s for s in (self.active, 'b' if self.active == 'a' else 'a')
+        return [s for s in [self.active] + [s for s in PORTS if s != self.active]
                 if account(s)['connected'] and self.cooldown[s] <= time.time()]
 
-    def limited(self, slot, retry_after=None):
+    def limited(self, slot, retry_after=None, revision=None):
         try:
             delay = max(60, float(retry_after))
         except (TypeError, ValueError):
             delay = 300
         self.cooldown[slot] = time.time() + delay
-        self.last_event = f'Account {slot.upper()} reached a limit; trying the other account'
+        if revision is None or revision == self.revision:
+            self.last_event = f'Account {slot.upper()} reached a limit; trying another account'
 
-    def selected(self, slot):
+    def selected(self, slot, revision=None, manual=False):
+        # A request started before a manual choice must not replace that choice
+        # when its upstream response arrives later.
+        if revision is not None and revision != self.revision:
+            return
         if slot != self.active:
-            Telemetry(STATE).switched(slot)
+            pending = STATE / 'routing.json.tmp'
+            pending.write_text(json.dumps({'active': slot}))
+            pending.replace(STATE / 'routing.json')
             self.active = slot
-            (STATE / 'routing.json').write_text(json.dumps({'active': slot}))
+            Telemetry(STATE).switched(slot)
             self.last_event = f'Using account {slot.upper()}'
+        if manual:
+            self.revision += 1
+            self.last_event = f'Account {slot.upper()} selected manually; new requests try it first'
+
+
+def error_text(payload):
+    """Inspect error fields only, never quoted conversation or output text."""
+    if isinstance(payload, str):
+        return payload.lower().replace('\u2019', "'")
+    if not isinstance(payload, dict):
+        return ''
+    if payload.get('error'):
+        return error_text(payload['error'])
+    response = payload.get('response')
+    if isinstance(response, dict) and response.get('error'):
+        return error_text(response['error'])
+    return ' '.join(str(payload.get(key) or '') for key in ('code', 'type', 'message')).lower().replace('\u2019', "'")
 
 
 def limit_error(payload):
-    text = json.dumps(payload).lower()
+    text = error_text(payload)
     return any(s in text for s in ('usage_limit_reached', 'rate_limit_exceeded',
-                                 'rate_limit_error', 'quota_exceeded', 'insufficient_quota'))
+        'rate_limit_error', 'quota_exceeded', 'insufficient_quota',
+        "you've hit your usage limit", 'you have hit your usage limit',
+        'usage limit reached', 'usage limit has been reached', 'rate limit exceeded'))
 
 
 def encrypted_error(payload):
-    text = json.dumps(payload).lower()
+    text = error_text(payload)
     return 'encrypted' in text and any(s in text for s in ('invalid', 'decrypt', 'verify'))
+
+
+def pre_output_event(event):
+    """Lifecycle scaffolding is safe to hold until actual output or a tool starts."""
+    kind = event.get('type')
+    if kind in ('response.created', 'response.in_progress', 'response.queued'):
+        return True
+    if kind == 'response.output_item.added':
+        item = event.get('item') or {}
+        return item.get('type') in ('message', 'reasoning') and not any(
+            item.get(field) for field in ('content', 'summary', 'encrypted_content'))
+    if kind in ('response.content_part.added', 'response.reasoning_summary_part.added'):
+        part = event.get('part') or {}
+        return part.get('type') in ('output_text', 'summary_text') and not part.get('text')
+    return False
+
+
+def port_available(port):
+    import socket
+    try:
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', port))
+        return True
+    except OSError:
+        return False
 
 
 def router_app():
@@ -305,7 +383,7 @@ def router_app():
     try:
         config = tomllib.loads((Path.home() / '.codex' / 'config.toml').read_text(encoding='utf-8-sig'))
         if config.get('model_provider') == 'dual-account-local':
-            app.state.activation = 'Verified and configured. Restart Codex to use the gateway.'
+            app.state.activation = 'Gateway configured. Account switches apply to new gateway requests without restarting Codex.'
     except (OSError, ValueError):
         pass
 
@@ -355,7 +433,7 @@ def router_app():
                                 ledger.quota(slot, response.json())
                         except (httpx.HTTPError, ValueError):
                             ledger.quota(slot, {'state': 'unavailable', 'updated_at': time.time()})
-                    await asyncio.gather(*(refresh(slot) for slot in PORTS))
+                    await asyncio.gather(*(refresh(slot) for slot in list(PORTS)))
                     await asyncio.sleep(60)
             quota_task = asyncio.create_task(refresh_quotas())
             try:
@@ -370,8 +448,20 @@ def router_app():
     app.router.lifespan_context = lifespan
 
     @app.get('/')
+    @app.get('/overview')
+    @app.get('/accounts')
+    @app.get('/agents')
+    @app.get('/activity')
+    @app.get('/settings')
     async def index():
         return HTMLResponse((HERE / 'index.html').read_text(encoding='utf-8'))
+
+    @app.get('/assets/{name}')
+    async def assets(name: str):
+        allowed = {'app.css': 'text/css', 'app.js': 'application/javascript', 'network.js': 'application/javascript'}
+        if name not in allowed:
+            raise HTTPException(404)
+        return Response((HERE / name).read_text(encoding='utf-8'), media_type=allowed[name])
 
     @app.get('/health')
     async def health():
@@ -397,8 +487,73 @@ def router_app():
             rows[slot] = {**info, 'login': login_state[slot],
                 'quota': ledger.quota(slot) if info['connected'] else {'state': 'disconnected'},
                 'cooldown_seconds': max(0, int(routing.cooldown[slot] - time.time()))}
+        try:
+            configuration = tomllib.loads((Path.home() / '.codex' / 'config.toml').read_text(encoding='utf-8-sig'))
+            provider_configured = configuration.get('model_provider') == 'dual-account-local'
+        except (OSError, ValueError):
+            provider_configured = False
         return {'accounts': rows, 'active': routing.active, 'last_event': routing.last_event,
-                'model': MODEL, 'activation': getattr(app.state, 'activation', 'Not activated'), 'activity': ledger.summary()}
+                'model': MODEL, 'activation': getattr(app.state, 'activation', 'Not activated'), 'activity': ledger.summary(),
+                'connection': {'provider_configured': provider_configured, 'scope': 'Only requests that pass through this gateway are counted. Existing chats can keep their original provider.'}}
+
+    @app.get('/admin/agents')
+    async def agents(request: Request, scope: str = 'workspace'):
+        admin(request)
+        if scope not in ('workspace', 'all'):
+            raise HTTPException(400, 'Choose workspace or all local tasks')
+        workspace = Path(os.environ.get('CODEX_GATEWAY_WORKSPACE', str(ROOT if HERE.name == 'gateway' else HERE)))
+        return await asyncio.to_thread(agent_snapshot, workspace, scope)
+
+    @app.post('/admin/select/{slot}')
+    async def select_account(slot: str, request: Request):
+        admin(request)
+        if slot not in PORTS:
+            raise HTTPException(404, 'Account worker not found')
+        if not account(slot)['connected']:
+            raise HTTPException(409, 'Connect this account before selecting it')
+        remaining = routing.cooldown[slot] - time.time()
+        if remaining > 0:
+            raise HTTPException(409, f'Account {slot.upper()} is cooling down. Try again in {max(1, int(remaining) + 1)}s.')
+        routing.selected(slot, manual=True)
+        return {'ok': True, 'active': routing.active, 'message':
+                f'Account {slot.upper()} selected for new gateway requests. Automatic failover stays on.'}
+
+    @app.post('/admin/accounts')
+    async def add_account(request: Request):
+        admin(request)
+        slot = next((chr(n) for n in range(ord('a'), ord('z') + 1) if chr(n) not in PORTS), None)
+        if not slot:
+            raise HTTPException(409, 'This installation supports up to 26 account workers')
+        port = 4001 + ord(slot) - ord('a')
+        # Avoid replacing a service already bound to the new worker port.
+        if not port_available(port):
+            raise HTTPException(409, f'Port {port} is occupied. Stop that service before adding this account.')
+        PORTS[slot] = port
+        (STATE / 'workers.json').write_text(json.dumps({'slots': list(PORTS)}))
+        routing.cooldown[slot] = 0.0
+        login_state[slot] = {'state': 'idle'}
+        spawn_worker(slot)
+        return {'ok': True, 'slot': slot}
+
+    @app.delete('/admin/accounts/{slot}')
+    async def remove_account(slot: str, request: Request):
+        admin(request)
+        if slot not in PORTS:
+            raise HTTPException(404)
+        if slot in ('a', 'b'):
+            raise HTTPException(409, 'The first two account desks stay available')
+        if account(slot)['connected'] or login_state[slot].get('state') in ('starting', 'waiting'):
+            raise HTTPException(409, 'Disconnect this account before removing its desk')
+        proc = worker_processes.pop(slot, None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+        PORTS.pop(slot)
+        routing.cooldown.pop(slot, None)
+        login_state.pop(slot, None)
+        (STATE / 'workers.json').write_text(json.dumps({'slots': list(PORTS)}))
+        if routing.active == slot:
+            routing.selected('a')
+        return {'ok': True}
 
     async def authenticate(slot):
         proc = None
@@ -436,21 +591,23 @@ def router_app():
     @app.post('/admin/activate')
     async def activate(request: Request):
         admin(request)
-        accounts = [account(s) for s in PORTS]
-        if not all(a['connected'] for a in accounts):
-            raise HTTPException(409, 'Connect both accounts first')
-        if accounts[0]['identity'] and accounts[0]['identity'] == accounts[1]['identity']:
-            raise HTTPException(409, 'Both slots use the same account. Connect two different accounts.')
-        app.state.activation = 'Checking both accounts'
+        connected = [s for s in PORTS if account(s)['connected']]
+        accounts = [account(s) for s in connected]
+        if len(accounts) < 2:
+            raise HTTPException(409, 'Connect at least two accounts first')
+        identities = [a['identity'] for a in accounts if a['identity']]
+        if len(identities) != len(set(identities)):
+            raise HTTPException(409, 'Some slots use the same account. Connect different accounts.')
+        app.state.activation = 'Checking connected accounts'
         try:
-            for slot in PORTS:
+            for slot in connected:
                 await verify_account(app.state.client, slot)
             configure_codex()
         except Exception as exc:
             app.state.activation = 'Verification failed; Codex provider was not changed'
             raise HTTPException(502, str(exc) if isinstance(exc, RuntimeError)
                                 else 'Could not verify the accounts. Please retry.')
-        app.state.activation = 'Verified and configured. Restart Codex to use the gateway.'
+        app.state.activation = 'Verified and configured. Restart Codex once and start a gateway chat. Later account switches do not require a restart.'
         return {'ok': True, 'message': app.state.activation}
 
     @app.post('/admin/disconnect/{slot}')
@@ -479,6 +636,7 @@ def router_app():
         if body.get('previous_response_id'):
             raise HTTPException(409, 'Send full conversation input for account-independent continuation')
         candidates = routing.candidates()
+        revision = routing.revision
         if not candidates:
             raise HTTPException(503, 'Connect an account, or wait for its allowance to reset')
         compact = request.url.path.endswith('/compact')
@@ -493,7 +651,8 @@ def router_app():
                     upstream = await app.state.client.send(app.state.client.build_request(
                         'POST', f'http://127.0.0.1:{PORTS[slot]}{request.url.path}', json=forwarded,
                         headers={'Authorization': 'Bearer ' + INTERNAL_KEY,
-                                 'session_id': request.headers.get('session_id', '')}), stream=True)
+                                 'session_id': request.headers.get('session-id') or request.headers.get('session_id') or request.headers.get('x-session-id', ''),
+                                 'thread-id': request_thread_id(request.headers) or ''}), stream=True)
                 except httpx.HTTPError:
                     last_response = JSONResponse({'error': {'message': 'Account worker unavailable'}}, 502)
                     break
@@ -505,7 +664,7 @@ def router_app():
                     except ValueError:
                         payload = {}
                     if upstream.status_code == 429 or limit_error(payload):
-                        routing.limited(slot, upstream.headers.get('retry-after'))
+                        routing.limited(slot, upstream.headers.get('retry-after'), revision=revision)
                         last_response = Response(data, upstream.status_code,
                             headers={'content-type': upstream.headers.get('content-type', 'application/json')})
                         break
@@ -515,16 +674,18 @@ def router_app():
                     if upstream.status_code >= 400:
                         return Response(data, upstream.status_code,
                             headers={'content-type': upstream.headers.get('content-type', 'application/json')})
-                    routing.selected(slot)
+                    routing.selected(slot, revision=revision)
                     return Response(data, upstream.status_code, media_type='application/json')
 
                 # Hold the initial events until output begins. A limit error can be
                 # represented inside an HTTP 200 stream instead of an HTTP 429.
                 iterator = upstream.aiter_lines()
                 prefix = []
+                prefix_size = 0
                 failure = None
                 async for line in iterator:
                     prefix.append(line + '\n')
+                    prefix_size += len(line) + 1
                     if line.startswith('data: '):
                         try:
                             event = json.loads(line[6:])
@@ -534,19 +695,19 @@ def router_app():
                         if kind in ('error', 'response.failed'):
                             failure = event
                             break
-                        if kind not in ('response.created', 'response.in_progress'):
+                        if not pre_output_event(event):
                             break
-                    if sum(map(len, prefix)) > 262144:
+                    if prefix_size > 262144:
                         break
                 if failure and (limit_error(failure) or encrypted_error(failure)):
                     await upstream.aclose()
                     if encrypted_error(failure) and attempt == 0:
                         body = transferable_input(original)
                         continue
-                    routing.limited(slot)
+                    routing.limited(slot, revision=revision)
                     last_response = JSONResponse({'error': {'message': 'Subscription allowance exhausted'}}, 429)
                     break
-                routing.selected(slot)
+                routing.selected(slot, revision=revision)
 
                 async def stream(upstream=upstream, iterator=iterator, prefix=prefix):
                     try:
@@ -595,7 +756,7 @@ def configure_codex():
         doc['model_catalog_json'] = str(catalog)
     providers = doc.setdefault('model_providers', tomlkit.table())
     provider = tomlkit.table()
-    provider.update({'name': 'Local dual-account gateway', 'base_url': 'http://127.0.0.1:4000/v1',
+    provider.update({'name': 'Local account gateway', 'base_url': 'http://127.0.0.1:4000/v1',
                      'wire_api': 'responses', 'supports_websockets': False})
     auth = tomlkit.table()
     auth.update({'command': str(PYTHON), 'args': [str(HERE / 'gateway.py'), '--print-key'],
@@ -607,8 +768,8 @@ def configure_codex():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--worker', choices=['a', 'b'])
-    parser.add_argument('--login', choices=['a', 'b'])
+    parser.add_argument('--worker', choices=list(PORTS))
+    parser.add_argument('--login', choices=list(PORTS))
     parser.add_argument('--print-key', action='store_true')
     args = parser.parse_args()
     if args.print_key:

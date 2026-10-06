@@ -10,3 +10,9 @@ auth.json
 config-before-gateway.toml
 models_cache.json
 model-catalog.json
+# Local recording drafts are not release assets.
+media/codex-relay-*.mp4
+media/codex-relay-*-cover.png
+media/codex-relay-captions.srt
+media/preview.html
+media/video-post-caption.txt

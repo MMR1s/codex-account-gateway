@@ -25,6 +25,29 @@ DONE = sse({'type': 'response.created'}, {'type': 'response.output_text.delta', 
 
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
+    def test_subagent_thread_header_takes_precedence_over_parent_session(self):
+        main='01a11296-80b8-74f0-bd83-cf5df814ab6a'
+        child='01a1114e-8fc5-7430-b762-6993bc6597cf'
+        self.assertEqual(gateway.request_thread_id({'thread-id':child,'session-id':main}),child)
+        self.assertEqual(gateway.request_thread_id({'session_id':main}),main)
+        self.assertIsNone(gateway.request_thread_id({'thread-id':'arbitrary private content'}))
+
+    async def test_thread_identity_is_forwarded_unchanged_during_failover(self):
+        child='01a1114e-8fc5-7430-b762-6993bc6597cf'
+        main='01a11296-80b8-74f0-bd83-cf5df814ab6a'
+        seen=[]
+        def handler(request):
+            seen.append((request.headers['thread-id'],request.headers['session_id']))
+            return httpx.Response(429,json={'error':{'code':'usage_limit_reached'}}) if request.url.port==4001 else httpx.Response(200,content=DONE,headers={'content-type':'text/event-stream'})
+        with tempfile.TemporaryDirectory() as temp, patch.object(gateway,'STATE',Path(temp)), patch.dict(gateway.PORTS,{'a':4001,'b':4002},clear=True), patch.object(gateway,'account',lambda slot:{'connected':True}):
+            app=gateway.router_app()
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
+                app.state.client=upstream
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://testserver') as client:
+                    response=await client.post('/v1/responses',json={'input':'test'},headers={'Authorization':'Bearer '+gateway.KEY,'thread-id':child,'session-id':main})
+                    self.assertEqual(response.status_code,200)
+            self.assertEqual(seen,[(child,main),(child,main)])
+
     async def run_case(self, handler, body, authorization=True):
         with tempfile.TemporaryDirectory() as temp, patch.object(gateway, 'STATE', Path(temp)), \
              patch.object(gateway, 'account', lambda slot: {'connected': True}):
@@ -71,6 +94,72 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('failed-A', response.text)
         self.assertIn('response.completed', response.text)
 
+    async def test_plain_text_usage_limit_fails_over(self):
+        calls = []
+        def handler(request):
+            calls.append(request.url.port)
+            if request.url.port == 4001:
+                return httpx.Response(400, json={'error': {
+                    'message': "You've hit your usage limit. Try again later."}})
+            return httpx.Response(200, content=DONE, headers={'content-type': 'text/event-stream'})
+        response = await self.run_case(handler, {'input': 'Continue the task'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls, [4001, 4002])
+        self.assertNotIn('usage limit', response.text)
+
+    async def test_plain_limit_after_queue_and_empty_reasoning_fails_over(self):
+        calls = []
+        def handler(request):
+            calls.append(request.url.port)
+            content = sse(
+                {'type': 'response.created', 'response': {'id': 'failed-A'}},
+                {'type': 'response.queued'},
+                {'type': 'response.output_item.added', 'item': {
+                    'type': 'reasoning', 'id': 'reasoning-A', 'summary': []}},
+                {'type': 'error', 'message': "You've hit your usage limit. Try again later."}
+            ) if request.url.port == 4001 else DONE
+            return httpx.Response(200, content=content, headers={'content-type': 'text/event-stream'})
+        response = await self.run_case(handler, {'input': 'Continue the task'})
+        self.assertEqual(calls, [4001, 4002])
+        self.assertNotIn('failed-A', response.text)
+        self.assertNotIn('reasoning-A', response.text)
+        self.assertIn('response.completed', response.text)
+
+    async def test_next_tool_turn_after_failover_uses_same_gateway_without_restart(self):
+        calls = []
+        body = {'input': [{'role': 'user', 'content': 'Keep the conversation'}]}
+        next_body = {'input': body['input'] + [
+            {'type': 'function_call', 'call_id': 'call_1', 'name': 'test', 'arguments': '{}'},
+            {'type': 'function_call_output', 'call_id': 'call_1', 'output': 'tool result'}]}
+        def handler(request):
+            calls.append((request.url.port, json.loads(request.content)))
+            if request.url.port == 4001:
+                return httpx.Response(200, content=sse({'type': 'response.failed', 'response': {
+                    'error': {'message': "You've hit your usage limit. Try again later."}}}),
+                    headers={'content-type': 'text/event-stream'})
+            return httpx.Response(200, content=DONE, headers={'content-type': 'text/event-stream'})
+        with tempfile.TemporaryDirectory() as temp, patch.object(gateway, 'STATE', Path(temp)), \
+             patch.dict(gateway.PORTS, {'a': 4001, 'b': 4002}, clear=True), \
+             patch.object(gateway, 'account', lambda slot: {'connected': True}):
+            app = gateway.router_app()
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
+                app.state.client = upstream
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                             base_url='http://testserver') as client:
+                    headers = {'Authorization': 'Bearer ' + gateway.KEY}
+                    first = await client.post('/v1/responses', json=body, headers=headers)
+                    self.assertIn('response.completed', first.text)
+                    second = await client.post('/v1/responses', json=next_body, headers=headers)
+                    self.assertIn('response.completed', second.text)
+                    self.assertEqual(second.headers['x-gateway-account'], 'B')
+            self.assertEqual([port for port, _ in calls], [4001, 4002, 4002])
+            self.assertEqual(calls[-1][1]['input'], next_body['input'])
+
+    def test_limit_text_in_normal_output_is_not_an_error(self):
+        self.assertFalse(gateway.limit_error({'output': [{'type': 'message',
+            'content': "You've hit your usage limit. Try again later."}]}))
+        self.assertFalse(gateway.limit_error({'error': {'message': 'Invalid image format'}}))
+
     async def test_partial_output_is_not_replayed(self):
         calls = []
         def handler(request):
@@ -83,6 +172,20 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [4001])
         self.assertIn('started', response.text)
         self.assertIn('response.failed', response.text)
+
+    async def test_tool_start_is_not_replayed_on_plain_limit(self):
+        calls = []
+        def handler(request):
+            calls.append(request.url.port)
+            return httpx.Response(200, content=sse(
+                {'type': 'response.output_item.added', 'item': {
+                    'type': 'function_call', 'call_id': 'call_1', 'name': 'test', 'arguments': ''}},
+                {'type': 'error', 'message': "You've hit your usage limit. Try again later."}),
+                headers={'content-type': 'text/event-stream'})
+        response = await self.run_case(handler, {'input': 'test'})
+        self.assertEqual(calls, [4001])
+        self.assertIn('call_1', response.text)
+        self.assertIn('usage limit', response.text)
 
     async def test_unauthenticated_request_cannot_use_accounts(self):
         def handler(request):
