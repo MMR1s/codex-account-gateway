@@ -1,0 +1,24 @@
+I built a local account gateway for Codex, and I’m sharing the experiment on GitHub.
+
+The idea is simple: keep the Codex app and local workspace familiar, while two separately authenticated accounts can handle model requests through a local router.
+
+When the selected account reports an allowance limit before output starts, the gateway can try the other account. Credentials and quotas stay separate.
+
+I also added a dashboard that shows:
+• Which account is selected and which account handled each request
+• Actual five-hour and weekly allowance percentages, remaining allowance, and reset times
+• Input, output, and cached tokens observed by the gateway
+• Request duration, outcomes, and account switches
+
+Your local chats and files stay in the same place. Remote access still uses the account signed into your Codex desktop; routing model requests through another account doesn’t change that desktop login.
+
+It’s an independent, experimental project built with FastAPI and LiteLLM OAuth helpers. Both accounts and live usage reporting have been tested. Limit failover is covered by automated tests; I haven’t deliberately exhausted subscriptions or verified phone control together with failover. Account-bound compacted context can still require the original account.
+
+No prompts or response text are stored in the activity database. Tokens shown are gateway-observed usage, not lifetime account totals.
+
+Code, Windows setup, and architecture:
+https://github.com/MMR1s/codex-account-gateway
+
+Feedback and contributions are welcome.
+
+#Codex #OpenSource #Python #DeveloperTools

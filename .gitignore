@@ -1,0 +1,12 @@
+.runtime/
+work/
+__pycache__/
+*.pyc
+.env*
+*.log
+*.sqlite*
+auth.json
+*key.txt
+config-before-gateway.toml
+models_cache.json
+model-catalog.json

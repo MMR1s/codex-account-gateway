@@ -1,0 +1,5 @@
+litellm==1.104.0
+fastapi==0.142.2
+uvicorn==0.54.0
+httpx==0.28.1
+tomlkit==0.15.1
