@@ -48,4 +48,4 @@ for i,(title,detail) in enumerate(labels):
 text(80,1025,'Separate credentials. Separate quotas. One local workspace.',30,bold=True)
 text(80,1080,'Experimental project · Opaque compacted context may require the original account.',22,'#8e91a0')
 text(80,1135,'github.com/MMR1s/codex-account-gateway',24,'#c6bed7')
-im.save(Path(__file__).with_name('how-it-works.png'))
+im.save(Path(__file__).resolve().parents[1]/'media'/'how-it-works.png')

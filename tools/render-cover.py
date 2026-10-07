@@ -1,7 +1,7 @@
 """Compose the project's existing brand and illustrative dashboard network.
 
 Requires Pillow and NumPy for asset production, not for running the gateway.
-Usage: python media/render-cover.py /path/to/cover-constellation.png
+Usage: python tools/render-cover.py [path/to/cover-constellation.png]
 """
 from pathlib import Path
 import sys
@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageOps
 
 W,H=2400,1260
-OUT=Path(__file__).resolve().parent
+OUT=Path(__file__).resolve().parents[1]/'media'
 source=Path(sys.argv[1]) if len(sys.argv)>1 else OUT/'cover-constellation.png'
 fonts=Path('C:/Windows/Fonts')
 def font(size,bold=False,mono=False):
@@ -55,7 +55,6 @@ text(122,971,'LOCAL FIRST',22,'#b5a1ff',mono=True)
 text(1250,1031,'ILLUSTRATIVE NETWORK / DEMO VALUES',18,'#81798f',mono=True)
 text(124,1144,'github.com/MMR1s/codex-account-gateway',26,'#dfdae8',mono=True)
 text(1958,1144,'MIT LICENSE',26,'#b5a1ff',mono=True)
-im.convert('RGB').save(OUT/'project-cover.png',optimize=True)
 im.convert('RGB').save(OUT/'project-cover.jpg',quality=94,subsampling=0,optimize=True)
 ImageOps.fit(im.convert('RGB'),(1280,640),Image.Resampling.LANCZOS,centering=(.5,.5)).save(OUT/'github-cover.png',optimize=True)
-print('Rendered project-cover.png, project-cover.jpg, github-cover.png')
+print('Rendered project-cover.jpg, github-cover.png')

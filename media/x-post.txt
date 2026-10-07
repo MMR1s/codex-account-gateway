@@ -1,6 +1,0 @@
-I built Codex Relay: one local workspace, separate account sign-ins, manual routing, allowance tracking, and agent/subagent views.
-
-Open source · MIT · Windows setup.
-
-Independent experiment:
-https://github.com/MMR1s/codex-account-gateway
