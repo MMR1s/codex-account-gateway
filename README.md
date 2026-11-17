@@ -13,6 +13,7 @@ Connect multiple separately signed-in accounts to one Codex interface. The local
 - Connect up to 26 accounts through isolated OAuth workers.
 - Automatically try another available account on a recognized usage limit before output or tools start.
 - Choose the account for new requests with **Use this account**.
+- Generate and edit images through the gateway image tool using eligible subscription accounts.
 - See reported five-hour and weekly allowance, remaining percentages, and reset times.
 - Explore recorded Codex agents and subagents, with lights for observed gateway requests.
 - Inspect captured requests, token usage, timing, outcomes, charts, and CSV exports.
@@ -20,6 +21,14 @@ Connect multiple separately signed-in accounts to one Codex interface. The local
 - Verify connected accounts before configuring Codex, with provider backup and restoration.
 
 See [dashboard and data details](docs/dashboard.md) for navigation, capture scope, and live-activity limitations.
+
+## General browser workspace
+
+The gateway now includes a shared browser workspace with persistent tabs, local website sessions, and a Codex sidebar. Open **Browser** in the dashboard, install the runtime with `Setup browser.ps1`, and use **Open browser workspace**. The browser supports general tasks and is independent of client finding.
+
+Local apps can consume structured inputs and outputs through `/v1/browser/*`; other agents can use the `gateway_browser.py` MCP server. Both share the gateway browser's tabs and sessions. Actions carry caller/request IDs, support result polling and metadata events, and queue clicks/typing for human approval. Opportunity Radar is one consumer through its **Inspect in gateway browser** action.
+
+See [browser setup, API contract, Python client, MCP integration, and limits](docs/browser-workspace.md). Browser AI tasks use the existing Codex account/provider configuration and its model limits. Website sign-ins are completed manually.
 
 ## Windows installation
 
@@ -32,7 +41,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Setup.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File '.\Start gateway.ps1'
 ```
 
-Open http://127.0.0.1:4000/ in your browser. Connect at least two different accounts. Use **Add account** for more desks (up to 26); each desk starts its own isolated worker. Sign in only on `auth.openai.com`; device code login may need enabling in ChatGPT Settings > Security. Use a separate browser profile for the second account if needed.
+Open http://127.0.0.1:4000/ in your browser. Connect at least one account. For automatic failover, connect two or more different accounts. Use **Add account** for more desks (up to 26); each desk starts its own isolated worker. Sign in only on `auth.openai.com`; device code login may need enabling in ChatGPT Settings > Security. Use a separate browser profile for the second account if needed.
 
 Open **Settings**, then select **Verify accounts & configure Codex**. Verification consumes one short prompt per account. Restart Codex and start a new chat. The model comes from your existing Codex configuration; `CODEX_GATEWAY_MODEL` can override it before starting the gateway. All connected accounts must have access to the selected model.
 
@@ -61,6 +70,16 @@ Token counts cover only requests observed by this gateway since tracking began, 
 A chat already using the gateway continues through the selected account without restarting Codex or the gateway. If a backend reports a recognized limit before output begins, the router tries another account within the same request. Lifecycle metadata is held back so Codex does not see the rejected account's preliminary response. Subsequent tool turns use the newly selected account and retain the full visible input.
 
 If Codex still shows “You've hit your usage limit”, check the chat's saved provider in **Agents**. An **OpenAI direct** chat sends requests outside the gateway and cannot use its fallback pool. Changing the default provider does not migrate that saved chat; start a gateway chat after the initial configuration reload. A restart is required for initial provider setup, not for each account switch. Errors after output or tool execution begins are still surfaced without replay, and unavailable accounts or account-bound compacted context can require user action.
+
+### Included image generation
+
+Coding requests use the gateway's private credential helper, with `requires_openai_auth = false`. The gateway chooses the backend account for each request; coding access does not depend on the desktop app's separately signed-in account or its cached allowance checks.
+
+Activation also registers a local MCP server named `gateway_images`. Its `generate_image` tool generates and edits pictures through the gateway using the selected account's included subscription image access. No Platform API key or paid API fallback is used. Reference image paths select editing; transparent backgrounds are supported. The tool returns an image preview and an absolute saved path under `CODEX_HOME/generated_images/gateway`.
+
+Restart Codex and start a new gateway chat after this configuration change. Use the **gateway_images** tool when asking for images. Codex may require permission for this local MCP tool; sessions that disallow approval prompts can block its first call. This installation does not disable tool approval checks. This replaces the native-image authentication setup, which tied the desktop's account checks to its signed-in account even when the gateway selected another worker. The gateway retains the native image endpoints and authentication compatibility for older chats, but new chats use the separate image tool.
+
+Image requests use the selected eligible worker and are sent once: errors or connection failures are returned without automatic replay or account failover, avoiding duplicate generations. Image allowance can differ from coding allowance. The ledger records image outcomes and durations without prompts, image bytes or image usage units. Successful images appear as **Image generated** and have their own activity filter; they are excluded from text-token and captured-response totals. Subscription and workspace eligibility still apply.
 
 ## Workspace and remote access
 
@@ -92,3 +111,8 @@ Live checks completed: connected accounts' streamed responses, real allowance sn
 ## Privacy and security
 
 Never publish `.runtime`, account auth files, key files, logs, databases, configuration backups, or model caches. `.gitignore` excludes these. Public assets contain no personal account data. See [SECURITY.md](SECURITY.md). MIT applies to this project's original code; dependencies keep their own licenses.
+
+
+## Reusable website APIs
+
+The shared browser now includes **API lab**, powered by pinned `api-anything@0.4.0`: record same-origin JSON traffic once, save a parameterized operation, and reuse it from Codex, apps, or other agents without repeating UI steps. Public catalog reads use plain HTTP; signed-in operations stay in the existing browser session. New recipes require review, and writes follow the browser approval policy. See [site API setup, research comparison, inputs/outputs, and limits](docs/site-api.md).

@@ -1,0 +1,25 @@
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const {ActionPermissions}=require('../action-permissions.cjs');
+const {BrowserBroker}=require('../broker.cjs');
+test('saved browser permissions are scoped, persisted, revocable and cannot come from action payloads',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'relay-permissions-'));
+  const permissions=new ActionPermissions(dir);
+  assert.equal(permissions.allows('opportunity-radar-jobs',{action:'click'}),false);
+  permissions.update({radar:true,assistant:true});
+  const loaded=new ActionPermissions(dir);
+  for(const action of ['click','fill','press','upload','api_call']) assert.equal(loaded.allows('opportunity-radar-jobs',{action}),true);
+  assert.equal(loaded.allows('assistant:thread',{action:'upload'}),true);
+  assert.equal(loaded.allows('another-app',{action:'click'}),false);
+  assert.equal(loaded.allows('opportunity-radar-jobs',{action:'api_learn'}),false);
+  assert.throws(()=>loaded.update({radar:'yes'}));
+  const calls=[];
+  const broker=new BrowserBroker({request:(a,c,authorized,persistent)=>{calls.push({authorized,persistent});return {promise:Promise.resolve({done:true})};}},loaded);
+  await broker.submit({clientId:'opportunity-radar-jobs',requestId:'one',action:{action:'press',key:'Enter'}});
+  assert.deepEqual(calls[0],{authorized:true,persistent:true});
+  loaded.update({radar:false});
+  await broker.submit({clientId:'opportunity-radar-jobs',requestId:'two',authorized:true,action:{action:'press',key:'Enter',authorized:true}});
+  assert.deepEqual(calls[1],{authorized:false,persistent:false});
+  assert.equal(path.dirname(path.resolve(dir)),path.resolve(os.tmpdir()));
+  fs.rmSync(dir,{recursive:true,force:true});
+});

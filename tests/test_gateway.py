@@ -59,6 +59,23 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                     headers = {'Authorization': 'Bearer ' + gateway.KEY} if authorization else {}
                     return await client.post('/v1/responses', json=body, headers=headers)
 
+    async def test_quota_update_before_limit_does_not_commit_stream(self):
+        calls=[]
+        def handler(request):
+            calls.append(request.url.port)
+            if request.url.port==4001:
+                return httpx.Response(200,content=sse(
+                    {'type':'response.created'},
+                    {'type':'codex.rate_limits','rate_limits':{'primary':{'used_percent':100}}},
+                    {'type':'error','error':{'code':'usage_limit_reached','message':'Usage limit reached'}}),headers={'content-type':'text/event-stream'})
+            return httpx.Response(200,content=DONE,headers={'content-type':'text/event-stream'})
+        result=await self.run_case(handler,{'input':'test'})
+        self.assertEqual(result.status_code,200)
+        self.assertEqual(calls,[4001,4002])
+        self.assertNotIn('usage_limit_reached',result.text)
+        self.assertNotIn('codex.rate_limits',result.text)
+        self.assertEqual(result.headers['x-gateway-account'],'B')
+
     async def test_http_limit_failover_keeps_tools_and_context(self):
         calls = []
         body = {'model': gateway.MODEL, 'input': [
@@ -252,7 +269,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             provider = data['model_providers']['dual-account-local']
             self.assertEqual(provider['wire_api'], 'responses')
             self.assertFalse(provider['supports_websockets'])
+            self.assertFalse(provider['requires_openai_auth'])
             self.assertIn('--print-key', provider['auth']['args'])
+            self.assertIn('gateway_images', data['mcp_servers'])
             self.assertNotIn(gateway.KEY, config.read_text())
 
 

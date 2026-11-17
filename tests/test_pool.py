@@ -10,6 +10,19 @@ import unittest
 from unittest.mock import patch
 
 class PoolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_activation_accepts_one_account_and_rejects_none(self):
+        from unittest.mock import AsyncMock
+        with tempfile.TemporaryDirectory() as temp, patch.object(gateway, 'STATE', Path(temp)), patch.object(gateway, 'account', lambda slot: {'connected': slot == 'b', 'identity': slot}), patch.object(gateway, 'verify_account', new_callable=AsyncMock) as verify, patch.object(gateway, 'configure_codex') as configure:
+            app = gateway.router_app()
+            app.state.client = object()
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://testserver', headers={'X-Gateway-Admin': '1'}) as client:
+                self.assertEqual((await client.post('/admin/activate')).status_code, 200)
+                verify.assert_awaited_once_with(app.state.client, 'b')
+                configure.assert_called_once()
+                with patch.object(gateway, 'account', lambda slot: {'connected': False}):
+                    self.assertEqual((await client.post('/admin/activate')).status_code, 409)
+                configure.assert_called_once()
+
     async def test_failover_reaches_third_account(self):
         calls=[]
         def handler(request):

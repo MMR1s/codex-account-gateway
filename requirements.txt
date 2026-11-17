@@ -3,3 +3,4 @@ fastapi==0.142.2
 uvicorn==0.54.0
 httpx==0.28.1
 tomlkit==0.15.1
+mcp==1.30.0

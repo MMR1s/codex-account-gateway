@@ -4,6 +4,24 @@ Secrets and runtime state live in a private runtime directory, excluded from Git
 """
 from __future__ import annotations
 
+# Credential lookup must stay independent of server dependencies and startup.
+import sys
+if __name__ == '__main__' and sys.argv[1:] == ['--print-key']:
+    import os
+    from pathlib import Path
+    helper_dir = Path(__file__).resolve().parent
+    legacy_state = helper_dir.parent.parent / 'work' / 'gateway-state'
+    default_state = legacy_state if helper_dir.name == 'gateway' and legacy_state.exists() else helper_dir / '.runtime' / 'state'
+    credential_state = Path(os.environ.get('CODEX_GATEWAY_STATE_DIR', str(default_state)))
+    try:
+        credential = (credential_state / 'gateway-key.txt').read_text(encoding='utf-8').strip()
+        if not credential:
+            raise ValueError('empty credential')
+    except (OSError, ValueError):
+        sys.exit('Gateway credential unavailable. Start the gateway first.')
+    print(credential)
+    sys.exit(0)
+
 import argparse
 import asyncio
 import base64
@@ -116,6 +134,53 @@ def authorized(request, key):
         raise HTTPException(401, 'Gateway credential required')
 
 
+
+def authorized_gateway(request):
+    # Keep legacy gateway credentials working for already-open chats.
+    supplied = request.headers.get('x-gateway-key', '')
+    if supplied and hmac.compare_digest(supplied, KEY):
+        return
+    bearer = request.headers.get('authorization', '')
+    if hmac.compare_digest(bearer, 'Bearer ' + KEY):
+        return
+    # Native ChatGPT auth enables Codex's image tool. Validate against the exact
+    # local sign-in credential; never trust unverified JWT claims or log tokens.
+    try:
+        codex_home = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
+        auth = json.loads((codex_home / 'auth.json').read_text(encoding='utf-8-sig'))
+        token = auth.get('tokens', {}).get('access_token')
+        if isinstance(token, str) and token and hmac.compare_digest(bearer, 'Bearer ' + token):
+            return
+    except (OSError, ValueError, AttributeError):
+        pass
+    raise HTTPException(401, 'Gateway credential or current local Codex sign-in required')
+
+
+def image_payload(response):
+    """Codex expects Images JSON, even when the subscription service sends SSE."""
+    if 'text/event-stream' not in response.headers.get('content-type', ''):
+        payload = response.json()
+        if not isinstance(payload, dict) or not payload.get('data'):
+            raise ValueError('Image service returned no images')
+        return payload
+    images = []
+    result = {}
+    for event in events(response.text):
+        kind = event.get('type', '')
+        if kind in ('error', 'image_generation.failed', 'image_edit.failed'):
+            raise ValueError('Image service reported a failed generation')
+        if kind in ('image_generation.completed', 'image_edit.completed') and event.get('b64_json'):
+            images.append({key: event[key] for key in ('b64_json', 'generation_id') if key in event})
+            result['created'] = event.get('created_at', int(time.time()))
+            for key in ('background', 'quality', 'size'):
+                if key in event:
+                    result[key] = event[key]
+    if not images:
+        raise ValueError('Image service returned no completed image')
+    result['data'] = images
+    return result
+
+
 def events(text):
     for line in text.splitlines():
         if line.startswith('data: '):
@@ -209,6 +274,50 @@ def worker_app(slot):
             return normalize_quota(response.json())
         except (httpx.HTTPError, ValueError, RuntimeError):
             return {'state': 'unavailable', 'updated_at': time.time()}
+
+    @app.post('/v1/images/generations')
+    @app.post('/v1/images/edits')
+    async def relay_image(request: Request):
+        authorized(request, INTERNAL_KEY)
+        if not account(slot)['connected']:
+            raise HTTPException(401, 'Account is not connected')
+        try:
+            async with auth_lock:
+                access = await asyncio.to_thread(auth.get_access_token)
+                aid = await asyncio.to_thread(auth.get_account_id)
+        except Exception:
+            raise HTTPException(401, 'Account needs to be reconnected')
+        body = await request.json()
+        headers = get_chatgpt_default_headers(access, aid)
+        headers['accept'] = 'application/json'
+        for name in ('originator', 'x-codex-image-turn-id'):
+            if request.headers.get(name):
+                headers[name] = request.headers[name]
+        started = time.monotonic()
+        tracking_id = ledger.begin(slot, body.get('model'), request_thread_id(request.headers))
+        outcome = 'image_failed'
+        try:
+            upstream = await app.state.client.post(
+                auth.get_api_base().rstrip('/') + '/images/' + request.url.path.rsplit('/', 1)[1],
+                json=body, headers=headers, timeout=300)
+            response_headers = {k: v for k, v in upstream.headers.items()
+                                if k.lower() in ('content-type', 'retry-after', 'x-codex-imagegen-request-id')}
+            if upstream.status_code >= 400:
+                outcome = 'image_http_' + str(upstream.status_code)
+                return Response(upstream.content, upstream.status_code, headers=response_headers)
+            try:
+                payload = image_payload(upstream)
+            except ValueError:
+                raise HTTPException(502, 'Image service did not return a completed image. The request was not retried.')
+            outcome = 'image_completed'
+            response_headers.pop('content-type', None)
+            return JSONResponse(payload, headers=response_headers)
+        except httpx.HTTPError:
+            raise HTTPException(502, 'Image service connection failed. The request was not retried.')
+        finally:
+            # Image units are kept out of text-token totals; never store image bytes.
+            ledger.record(slot, body.get('model'), outcome, None, time.monotonic() - started)
+            ledger.end(tracking_id)
 
     @app.post('/v1/responses')
     @app.post('/v1/responses/compact')
@@ -350,7 +459,8 @@ def encrypted_error(payload):
 def pre_output_event(event):
     """Lifecycle scaffolding is safe to hold until actual output or a tool starts."""
     kind = event.get('type')
-    if kind in ('response.created', 'response.in_progress', 'response.queued'):
+    if kind in ('response.created', 'response.in_progress', 'response.queued',
+                'codex.rate_limits', 'rate_limits.updated', 'rate_limits', 'ping', 'keepalive'):
         return True
     if kind == 'response.output_item.added':
         item = event.get('item') or {}
@@ -403,6 +513,9 @@ def router_app():
         if request.headers.get('x-gateway-admin') != '1':
             raise HTTPException(403, 'Use the local connection page')
 
+    from browser_workspace import install_browser_routes
+    install_browser_routes(app, HERE, STATE, admin, authorized_gateway)
+
     def spawn_worker(slot):
         log = open(STATE / f'worker-{slot}.log', 'ab')
         process = subprocess.Popen([str(PYTHON), str(HERE / 'gateway.py'), '--worker', slot],
@@ -453,12 +566,13 @@ def router_app():
     @app.get('/agents')
     @app.get('/activity')
     @app.get('/settings')
+    @app.get('/browser')
     async def index():
         return HTMLResponse((HERE / 'index.html').read_text(encoding='utf-8'))
 
     @app.get('/assets/{name}')
     async def assets(name: str):
-        allowed = {'app.css': 'text/css', 'app.js': 'application/javascript', 'network.js': 'application/javascript'}
+        allowed = {'app.css': 'text/css', 'app.js': 'application/javascript', 'network.js': 'application/javascript', 'browser-dashboard.js': 'application/javascript'}
         if name not in allowed:
             raise HTTPException(404)
         return Response((HERE / name).read_text(encoding='utf-8'), media_type=allowed[name])
@@ -467,9 +581,10 @@ def router_app():
     async def health():
         return {'ok': True, 'service': 'dual-account-local', 'active': routing.active}
 
+    @app.get('/backend-api/codex/models')
     @app.get('/v1/models')
     async def models(request: Request):
-        authorized(request, KEY)
+        authorized_gateway(request)
         catalog = STATE / 'model-catalog.json'
         if not catalog.exists():
             raise HTTPException(503, 'Model catalog is not configured')
@@ -593,8 +708,8 @@ def router_app():
         admin(request)
         connected = [s for s in PORTS if account(s)['connected']]
         accounts = [account(s) for s in connected]
-        if len(accounts) < 2:
-            raise HTTPException(409, 'Connect at least two accounts first')
+        if not accounts:
+            raise HTTPException(409, 'Connect at least one account first')
         identities = [a['identity'] for a in accounts if a['identity']]
         if len(identities) != len(set(identities)):
             raise HTTPException(409, 'Some slots use the same account. Connect different accounts.')
@@ -628,10 +743,44 @@ def router_app():
         routing.cooldown[slot] = 0
         return {'ok': True}
 
+    @app.post('/backend-api/codex/images/generations')
+    @app.post('/backend-api/codex/images/edits')
+    @app.post('/v1/images/generations')
+    @app.post('/v1/images/edits')
+    async def route_image(request: Request):
+        authorized_gateway(request)
+        candidates = routing.candidates()
+        revision = routing.revision
+        if not candidates:
+            raise HTTPException(503, 'Connect an account, or wait for its allowance to reset')
+        slot = candidates[0]
+        body = await request.json()
+        headers = {'Authorization': 'Bearer ' + INTERNAL_KEY,
+                   'thread-id': request_thread_id(request.headers) or ''}
+        for name in ('originator', 'x-codex-image-turn-id'):
+            if request.headers.get(name):
+                headers[name] = request.headers[name]
+        try:
+            upstream = await app.state.client.post(
+                f'http://127.0.0.1:{PORTS[slot]}/v1/images/' + request.url.path.rsplit('/', 1)[1],
+                json=body, headers=headers, timeout=330)
+        except httpx.HTTPError:
+            raise HTTPException(502, 'Image worker connection failed. The request was not retried.')
+        if upstream.status_code == 429:
+            routing.limited(slot, upstream.headers.get('retry-after'), revision=revision)
+        elif upstream.status_code < 400:
+            routing.selected(slot, revision=revision)
+        response_headers = {k: v for k, v in upstream.headers.items()
+                            if k.lower() in ('content-type', 'retry-after', 'x-codex-imagegen-request-id')}
+        response_headers['X-Gateway-Account'] = slot
+        return Response(upstream.content, upstream.status_code, headers=response_headers)
+
+    @app.post('/backend-api/codex/responses')
+    @app.post('/backend-api/codex/responses/compact')
     @app.post('/v1/responses')
     @app.post('/v1/responses/compact')
     async def route(request: Request):
-        authorized(request, KEY)
+        authorized_gateway(request)
         body = await request.json()
         if body.get('previous_response_id'):
             raise HTTPException(409, 'Send full conversation input for account-independent continuation')
@@ -649,7 +798,7 @@ def router_app():
                     forwarded['stream'] = True
                 try:
                     upstream = await app.state.client.send(app.state.client.build_request(
-                        'POST', f'http://127.0.0.1:{PORTS[slot]}{request.url.path}', json=forwarded,
+                        'POST', f'http://127.0.0.1:{PORTS[slot]}' + request.url.path.replace('/backend-api/codex/', '/v1/', 1), json=forwarded,
                         headers={'Authorization': 'Bearer ' + INTERNAL_KEY,
                                  'session_id': request.headers.get('session-id') or request.headers.get('session_id') or request.headers.get('x-session-id', ''),
                                  'thread-id': request_thread_id(request.headers) or ''}), stream=True)
@@ -756,12 +905,17 @@ def configure_codex():
         doc['model_catalog_json'] = str(catalog)
     providers = doc.setdefault('model_providers', tomlkit.table())
     provider = tomlkit.table()
-    provider.update({'name': 'Local account gateway', 'base_url': 'http://127.0.0.1:4000/v1',
+    provider.update({'name': 'Local account gateway', 'base_url': 'http://127.0.0.1:4000/backend-api/codex',
                      'wire_api': 'responses', 'supports_websockets': False})
-    auth = tomlkit.table()
-    auth.update({'command': str(PYTHON), 'args': [str(HERE / 'gateway.py'), '--print-key'],
-                 'timeout_ms': 5000, 'refresh_interval_ms': 300000})
-    provider['auth'] = auth
+    # Keep desktop account allowance checks out of the coding routing path.
+    provider['requires_openai_auth'] = False
+    provider['auth'] = {'command': str(PYTHON),
+                        'args': ['-S', str(HERE / 'gateway.py'), '--print-key'],
+                        'timeout_ms': 30000, 'refresh_interval_ms': 300000}
+    servers = doc.setdefault('mcp_servers', tomlkit.table())
+    servers['gateway_images'] = {'command': str(PYTHON),
+                                 'args': [str(HERE / 'gateway_images.py')],
+                                 'startup_timeout_sec': 90, 'tool_timeout_sec': 360}
     providers['dual-account-local'] = provider
     path.write_text(tomlkit.dumps(doc), encoding='utf-8')
 

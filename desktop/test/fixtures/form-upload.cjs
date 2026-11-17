@@ -1,0 +1,44 @@
+'use strict';
+const {app,BrowserWindow,WebContentsView,session}=require('electron');
+const http=require('node:http'), fs=require('node:fs'), os=require('node:os'), path=require('node:path'), assert=require('node:assert/strict');
+const {BrowserWorkspace}=require('../../browser.cjs');
+const folder=fs.mkdtempSync(path.join(os.tmpdir(),'relay-form-fixture-'));
+app.setPath('userData',path.join(folder,'profile'));
+app.whenReady().then(async()=>{
+  const server=http.createServer((_req,res)=>{res.setHeader('Content-Type','text/html');res.end('<main>Fixture outside dialog</main><div role="dialog"><h1>Compose</h1><span email="careers@example.com">Recipient</span><input name="subjectbox" value="Verified subject"><div role="textbox" contenteditable="true">Verified body</div><input type="password" value="fixture-secret"><input type="file" hidden><button>Send</button><p>Line one\n    line two</p></div>');});
+  await new Promise(r=>server.listen(0,'127.0.0.1',r));
+  const window=new BrowserWindow({show:false,webPreferences:{sandbox:true}});
+  const browser=new BrowserWorkspace({window,View:WebContentsView,browserSession:session.fromPartition('fixture'),emit:()=>{}});
+  try {
+    const {tabId}=await browser.execute({action:'open',url:'http://127.0.0.1:'+server.address().port});
+    const wc=browser.tab(tabId).view.webContents;
+    if(wc.isLoading())await new Promise(r=>wc.once('did-finish-load',r));
+    const basic=await browser.execute({action:'snapshot',tabId});
+    assert.ok(basic.elements.every(e=>e.value===undefined));
+    assert.ok(!JSON.stringify(basic).includes('fixture-secret'));
+    const form=await browser.execute({action:'form_snapshot',tabId});
+    assert.equal(form.scopedDialog,true);assert.deepEqual(form.recipients,['careers@example.com']);
+    assert.equal(form.elements.find(e=>e.name==='subjectbox').value,'Verified subject');
+    assert.equal(form.elements.find(e=>e.role==='textbox').value,'Verified body');
+    assert.ok(!JSON.stringify(form).includes('fixture-secret'));assert.ok(!form.text.includes('outside dialog'));
+    assert.ok(!form.text.includes('\n'),'text whitespace normalized');
+    const filename=path.join(folder,'fixture-resume.pdf');fs.writeFileSync(filename,'%PDF-1.4 fixture');
+    const upload=browser.request({action:'upload',tabId,ref:form.elements.find(e=>e.type==='file').ref,path:filename},'test-app');
+    assert.ok(upload.approvalId);assert.equal(await wc.executeJavaScript('document.querySelector("input[type=file]").files.length'),0);
+    await browser.decide(upload.approvalId,true);await upload.promise;
+    assert.equal(await wc.executeJavaScript('document.querySelector("input[type=file]").files[0].name'),'fixture-resume.pdf');
+    const {BrowserBroker}=require('../../broker.cjs');
+    const {ActionPermissions}=require('../../action-permissions.cjs');
+    const permissions=new ActionPermissions(folder);permissions.update({radar:true});
+    const broker=new BrowserBroker(browser,permissions);
+    const fresh=await browser.execute({action:'form_snapshot',tabId});
+    const automatic=await broker.submit({clientId:'opportunity-radar-jobs',requestId:'automatic-fixture-upload',action:{action:'upload',tabId,ref:fresh.elements.find(e=>e.type==='file').ref,path:filename}});
+    assert.equal(automatic.state,'complete');assert.equal(automatic.approvalId,null);assert.equal(browser.pending.size,0);
+    const closed=new Promise(resolve=>wc.once('destroyed',resolve));
+    wc.close(); await closed;
+    assert.equal(browser.state().tabs.some(t=>t.id===tabId),false);
+    const reopened=await browser.execute({action:'open',url:'http://127.0.0.1:'+server.address().port});
+    assert.ok(browser.state().tabs.some(t=>t.id===reopened.tabId));
+    console.log(JSON.stringify({formSnapshot:true,passwordOmitted:true,uploadApproval:true,fileAttached:true,automaticUpload:true,closedTabRemoved:true,newTabAfterClose:true}));
+  } finally {browser.destroy();window.destroy();server.close();app.quit();}
+}).catch(e=>{console.error(e.stack);app.exit(1);});
