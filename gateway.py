@@ -566,9 +566,18 @@ def router_app():
     @app.get('/agents')
     @app.get('/activity')
     @app.get('/settings')
+    @app.get('/guide')
     @app.get('/browser')
     async def index():
-        return HTMLResponse((HERE / 'index.html').read_text(encoding='utf-8'))
+        from agent_guide import guide_html, guide_text
+        page = (HERE / 'index.html').read_text(encoding='utf-8')
+        return HTMLResponse(page.replace('<!--AGENT_GUIDE-->', guide_html(guide_text(HERE))))
+
+    @app.get('/llms.txt')
+    @app.get('/guide.md')
+    async def agent_instructions():
+        from agent_guide import guide_text
+        return Response(guide_text(HERE), media_type='text/plain; charset=utf-8')
 
     @app.get('/assets/{name}')
     async def assets(name: str):

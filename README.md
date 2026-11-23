@@ -8,6 +8,8 @@ Connect multiple separately signed-in accounts to one Codex interface. The local
 
 [How it works](media/how-it-works.png) · [MIT license](LICENSE) · [Recording a demo](docs/demo.md)
 
+Agent integration reference: open **Agent guide** in the dashboard, or fetch `http://127.0.0.1:4000/llms.txt`. The same source is available in [docs/agent-guide.md](docs/agent-guide.md).
+
 ## Features
 
 - Connect up to 26 accounts through isolated OAuth workers.
